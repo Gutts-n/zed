@@ -344,6 +344,16 @@ impl LanguageServer {
             root_path.parent().unwrap_or_else(|| Path::new("/"))
         };
 
+        let prefix = r"\\?\UNC";
+        let path_str = path.to_string_lossy();
+
+        if working_dir.starts_with(prefix) {
+            // Remove the prefix and reconstruct the path
+            PathBuf::from(&path_str[prefix.len()..])
+        } else {
+            working_dir.to_path_buf()
+        }
+
         log::info!(
             "starting language server process. binary path: {:?}, working directory: {:?}, args: {:?}",
             binary.path,
