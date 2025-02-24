@@ -338,7 +338,7 @@ impl LanguageServer {
         code_action_kinds: Option<Vec<CodeActionKind>>,
         cx: AsyncApp,
     ) -> Result<Self> {
-        let working_dir = if root_path.is_dir() {
+        let mut working_dir = if root_path.is_dir() {
             root_path
         } else {
             root_path.parent().unwrap_or_else(|| Path::new("/"))
