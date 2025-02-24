@@ -344,9 +344,6 @@ impl LanguageServer {
             root_path.parent().unwrap_or_else(|| Path::new("/"))
         };
 
-     
-        let path_str = path.to_string_lossy();
-
         let unc_prefix = "\\\\?\\UNC";
         let path_str = working_dir.to_string_lossy();
         if path_str.starts_with(unc_prefix) {
