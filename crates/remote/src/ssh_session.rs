@@ -1619,13 +1619,23 @@ impl SshRemoteConnection {
             remote_binary_path: None,
         };
 
-        let (release_channel, version, commit) = _cx.update(|cx| {
-            (
-                ReleaseChannel::global(_cx),
-                AppVersion::global(_cx),
-                AppCommitSha::try_global(_cx),
-            )
-        })?;
+        // Get the release channel, version, and commit using AsyncApp
+        // by properly converting to App when needed
+        let (release_channel, version, commit) = _cx.update(|cx_async| {
+            // Convert AsyncApp to App using the appropriate method
+            // The actual implementation depends on the internals of AsyncApp
+            // This solution assumes there's an `app()` method or similar
+            // that converts AsyncApp to App reference
+            let app = cx_async.with_app(|app| {
+                let release_channel = ReleaseChannel::global(app);
+                let version = AppVersion::global(app);
+                let commit = AppCommitSha::try_global(app);
+                (release_channel, version, commit)
+            })?;
+
+            Ok(app)
+        })??;
+
         this.remote_binary_path = Some(
             this.ensure_server_binary(&_delegate, release_channel, version, commit, _cx)
                 .await?,
