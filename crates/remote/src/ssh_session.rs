@@ -1448,6 +1448,7 @@ impl SshRemoteConnection {
         use futures::AsyncWriteExt as _;
         use futures::{io::BufReader, AsyncBufReadExt as _};
         use smol::net::TcpListener;
+        use std::os::windows::io::FromRawSocket;
         use util::ResultExt as _;
         use std::os::fd::FromRawFd;
         use which::which;
