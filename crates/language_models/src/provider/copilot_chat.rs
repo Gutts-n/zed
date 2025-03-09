@@ -11,8 +11,8 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use gpui::{
-    percentage, svg, Animation, AnimationExt, AnyView, App, AsyncApp, Entity, Render, Subscription,
-    Task, Transformation,
+    percentage, svg, Action, Animation, AnimationExt, AnyView, App, AsyncApp, Entity, Render,
+    Subscription, Task, Transformation,
 };
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionEvent, LanguageModelId,
@@ -87,6 +87,14 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
 
     fn icon(&self) -> IconName {
         IconName::Copilot
+    }
+
+    fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        let model = CopilotChatModel::default();
+        Some(Arc::new(CopilotChatLanguageModel {
+            model,
+            request_limiter: RateLimiter::new(4),
+        }) as Arc<dyn LanguageModel>)
     }
 
     fn provided_models(&self, _cx: &App) -> Vec<Arc<dyn LanguageModel>> {
@@ -177,6 +185,7 @@ impl LanguageModel for CopilotChatLanguageModel {
     ) -> BoxFuture<'static, Result<usize>> {
         match self.model {
             CopilotChatModel::Claude3_5Sonnet => count_anthropic_tokens(request, cx),
+            CopilotChatModel::Claude3_7Sonnet => count_anthropic_tokens(request, cx),
             CopilotChatModel::Gemini20Flash => count_google_tokens(request, cx),
             _ => {
                 let model = match self.model {
@@ -184,7 +193,9 @@ impl LanguageModel for CopilotChatLanguageModel {
                     CopilotChatModel::Gpt4 => open_ai::Model::Four,
                     CopilotChatModel::Gpt3_5Turbo => open_ai::Model::ThreePointFiveTurbo,
                     CopilotChatModel::O1 | CopilotChatModel::O3Mini => open_ai::Model::Four,
-                    CopilotChatModel::Claude3_5Sonnet | CopilotChatModel::Gemini20Flash => {
+                    CopilotChatModel::Claude3_5Sonnet
+                    | CopilotChatModel::Claude3_7Sonnet
+                    | CopilotChatModel::Gemini20Flash => {
                         unreachable!()
                     }
                 };
@@ -326,9 +337,20 @@ impl Render for ConfigurationView {
         if self.state.read(cx).is_authenticated(cx) {
             const LABEL: &str = "Authorized.";
             h_flex()
-                .gap_1()
-                .child(Icon::new(IconName::Check).color(Color::Success))
-                .child(Label::new(LABEL))
+                .justify_between()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(IconName::Check).color(Color::Success))
+                        .child(Label::new(LABEL)),
+                )
+                .child(
+                    Button::new("sign_out", "Sign Out")
+                        .style(ui::ButtonStyle::Filled)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(copilot::SignOut.boxed_clone(), cx);
+                        }),
+                )
         } else {
             let loading_icon = svg()
                 .size_8()
