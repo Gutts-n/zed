@@ -1438,7 +1438,7 @@ impl RemoteConnection for SshRemoteConnection {
 }
 
 impl SshRemoteConnection {
-    #[cfg(unix)]
+    #[cfg(not(unix))]
     async fn new(
         _connection_options: SshConnectionOptions,
         _delegate: Arc<dyn SshClientDelegate>,
