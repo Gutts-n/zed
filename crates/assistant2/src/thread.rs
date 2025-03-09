@@ -1,28 +1,34 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use assistant_scripting::{
+    Script, ScriptEvent, ScriptId, ScriptSession, ScriptTagParser, SCRIPTING_PROMPT,
+};
 use assistant_tool::ToolWorkingSet;
 use chrono::{DateTime, Utc};
 use collections::{BTreeMap, HashMap, HashSet};
-use futures::future::Shared;
-use futures::{FutureExt as _, StreamExt as _};
-use gpui::{App, Context, EventEmitter, SharedString, Task};
+use futures::StreamExt as _;
+use gpui::{App, AppContext, Context, Entity, EventEmitter, SharedString, Subscription, Task};
 use language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse,
-    LanguageModelToolUseId, MessageContent, Role, StopReason,
+    LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+    LanguageModelToolUseId, MaxMonthlySpendReachedError, MessageContent, PaymentRequiredError,
+    Role, StopReason,
 };
-use language_models::provider::cloud::{MaxMonthlySpendReachedError, PaymentRequiredError};
+use project::Project;
 use serde::{Deserialize, Serialize};
 use util::{post_inc, TryFutureExt as _};
 use uuid::Uuid;
 
 use crate::context::{attach_context_to_message, ContextId, ContextSnapshot};
 use crate::thread_store::SavedThread;
+use crate::tool_use::{PendingToolUse, ToolUse, ToolUseState};
 
 #[derive(Debug, Clone, Copy)]
 pub enum RequestKind {
     Chat,
+    /// Used when summarizing a thread.
+    Summarize,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
@@ -41,7 +47,7 @@ impl std::fmt::Display for ThreadId {
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Serialize, Deserialize)]
-pub struct MessageId(usize);
+pub struct MessageId(pub(crate) usize);
 
 impl MessageId {
     fn post_inc(&mut self) -> Self {
@@ -69,14 +75,24 @@ pub struct Thread {
     context_by_message: HashMap<MessageId, Vec<ContextId>>,
     completion_count: usize,
     pending_completions: Vec<PendingCompletion>,
+    project: Entity<Project>,
     tools: Arc<ToolWorkingSet>,
-    tool_uses_by_message: HashMap<MessageId, Vec<LanguageModelToolUse>>,
-    tool_results_by_message: HashMap<MessageId, Vec<LanguageModelToolResult>>,
-    pending_tool_uses_by_id: HashMap<LanguageModelToolUseId, PendingToolUse>,
+    tool_use: ToolUseState,
+    scripts_by_assistant_message: HashMap<MessageId, ScriptId>,
+    script_output_messages: HashSet<MessageId>,
+    script_session: Entity<ScriptSession>,
+    _script_session_subscription: Subscription,
 }
 
 impl Thread {
-    pub fn new(tools: Arc<ToolWorkingSet>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        project: Entity<Project>,
+        tools: Arc<ToolWorkingSet>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let script_session = cx.new(|cx| ScriptSession::new(project.clone(), cx));
+        let script_session_subscription = cx.subscribe(&script_session, Self::handle_script_event);
+
         Self {
             id: ThreadId::new(),
             updated_at: Utc::now(),
@@ -88,20 +104,33 @@ impl Thread {
             context_by_message: HashMap::default(),
             completion_count: 0,
             pending_completions: Vec::new(),
+            project,
             tools,
-            tool_uses_by_message: HashMap::default(),
-            tool_results_by_message: HashMap::default(),
-            pending_tool_uses_by_id: HashMap::default(),
+            tool_use: ToolUseState::new(),
+            scripts_by_assistant_message: HashMap::default(),
+            script_output_messages: HashSet::default(),
+            script_session,
+            _script_session_subscription: script_session_subscription,
         }
     }
 
     pub fn from_saved(
         id: ThreadId,
         saved: SavedThread,
+        project: Entity<Project>,
         tools: Arc<ToolWorkingSet>,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
-        let next_message_id = MessageId(saved.messages.len());
+        let next_message_id = MessageId(
+            saved
+                .messages
+                .last()
+                .map(|message| message.id.0 + 1)
+                .unwrap_or(0),
+        );
+        let tool_use = ToolUseState::from_saved_messages(&saved.messages);
+        let script_session = cx.new(|cx| ScriptSession::new(project.clone(), cx));
+        let script_session_subscription = cx.subscribe(&script_session, Self::handle_script_event);
 
         Self {
             id,
@@ -122,10 +151,13 @@ impl Thread {
             context_by_message: HashMap::default(),
             completion_count: 0,
             pending_completions: Vec::new(),
+            project,
             tools,
-            tool_uses_by_message: HashMap::default(),
-            tool_results_by_message: HashMap::default(),
-            pending_tool_uses_by_id: HashMap::default(),
+            tool_use,
+            scripts_by_assistant_message: HashMap::default(),
+            script_output_messages: HashSet::default(),
+            script_session,
+            _script_session_subscription: script_session_subscription,
         }
     }
 
@@ -187,7 +219,32 @@ impl Thread {
     }
 
     pub fn pending_tool_uses(&self) -> Vec<&PendingToolUse> {
-        self.pending_tool_uses_by_id.values().collect()
+        self.tool_use.pending_tool_uses()
+    }
+
+    /// Returns whether all of the tool uses have finished running.
+    pub fn all_tools_finished(&self) -> bool {
+        // If the only pending tool uses left are the ones with errors, then that means that we've finished running all
+        // of the pending tools.
+        self.pending_tool_uses()
+            .into_iter()
+            .all(|tool_use| tool_use.status.is_error())
+    }
+
+    pub fn tool_uses_for_message(&self, id: MessageId) -> Vec<ToolUse> {
+        self.tool_use.tool_uses_for_message(id)
+    }
+
+    pub fn tool_results_for_message(&self, id: MessageId) -> Vec<&LanguageModelToolResult> {
+        self.tool_use.tool_results_for_message(id)
+    }
+
+    pub fn message_has_tool_results(&self, message_id: MessageId) -> bool {
+        self.tool_use.message_has_tool_results(message_id)
+    }
+
+    pub fn message_has_script_output(&self, message_id: MessageId) -> bool {
+        self.script_output_messages.contains(&message_id)
     }
 
     pub fn insert_user_message(
@@ -195,12 +252,13 @@ impl Thread {
         text: impl Into<String>,
         context: Vec<ContextSnapshot>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> MessageId {
         let message_id = self.insert_message(Role::User, text, cx);
         let context_ids = context.iter().map(|context| context.id).collect::<Vec<_>>();
         self.context
             .extend(context.into_iter().map(|context| (context.id, context)));
         self.context_by_message.insert(message_id, context_ids);
+        message_id
     }
 
     pub fn insert_message(
@@ -218,6 +276,34 @@ impl Thread {
         self.touch_updated_at();
         cx.emit(ThreadEvent::MessageAdded(id));
         id
+    }
+
+    pub fn edit_message(
+        &mut self,
+        id: MessageId,
+        new_role: Role,
+        new_text: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(message) = self.messages.iter_mut().find(|message| message.id == id) else {
+            return false;
+        };
+        message.role = new_role;
+        message.text = new_text;
+        self.touch_updated_at();
+        cx.emit(ThreadEvent::MessageEdited(id));
+        true
+    }
+
+    pub fn delete_message(&mut self, id: MessageId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.messages.iter().position(|message| message.id == id) else {
+            return false;
+        };
+        self.messages.remove(index);
+        self.context_by_message.remove(&id);
+        self.touch_updated_at();
+        cx.emit(ThreadEvent::MessageDeleted(id));
+        true
     }
 
     /// Returns the representation of this [`Thread`] in a textual form.
@@ -241,10 +327,68 @@ impl Thread {
         text
     }
 
+    pub fn script_for_message<'a>(
+        &'a self,
+        message_id: MessageId,
+        cx: &'a App,
+    ) -> Option<&'a Script> {
+        self.scripts_by_assistant_message
+            .get(&message_id)
+            .map(|script_id| self.script_session.read(cx).get(*script_id))
+    }
+
+    fn handle_script_event(
+        &mut self,
+        _script_session: Entity<ScriptSession>,
+        event: &ScriptEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ScriptEvent::Spawned(_) => {}
+            ScriptEvent::Exited(script_id) => {
+                if let Some(output_message) = self
+                    .script_session
+                    .read(cx)
+                    .get(*script_id)
+                    .output_message_for_llm()
+                {
+                    let message_id = self.insert_user_message(output_message, vec![], cx);
+                    self.script_output_messages.insert(message_id);
+                    cx.emit(ThreadEvent::ScriptFinished)
+                }
+            }
+        }
+    }
+
+    pub fn send_to_model(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        request_kind: RequestKind,
+        use_tools: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut request = self.to_completion_request(request_kind, cx);
+
+        if use_tools {
+            request.tools = self
+                .tools()
+                .tools(cx)
+                .into_iter()
+                .map(|tool| LanguageModelRequestTool {
+                    name: tool.name(),
+                    description: tool.description(),
+                    input_schema: tool.input_schema(),
+                })
+                .collect();
+        }
+
+        self.stream_completion(request, model, cx);
+    }
+
     pub fn to_completion_request(
         &self,
-        _request_kind: RequestKind,
-        _cx: &App,
+        request_kind: RequestKind,
+        cx: &App,
     ) -> LanguageModelRequest {
         let mut request = LanguageModelRequest {
             messages: vec![],
@@ -252,6 +396,12 @@ impl Thread {
             stop: Vec::new(),
             temperature: None,
         };
+
+        request.messages.push(LanguageModelRequestMessage {
+            role: Role::System,
+            content: vec![SCRIPTING_PROMPT.to_string().into()],
+            cache: true,
+        });
 
         let mut referenced_context_ids = HashSet::default();
 
@@ -266,11 +416,13 @@ impl Thread {
                 cache: false,
             };
 
-            if let Some(tool_results) = self.tool_results_by_message.get(&message.id) {
-                for tool_result in tool_results {
-                    request_message
-                        .content
-                        .push(MessageContent::ToolResult(tool_result.clone()));
+            match request_kind {
+                RequestKind::Chat => {
+                    self.tool_use
+                        .attach_tool_results(message.id, &mut request_message);
+                }
+                RequestKind::Summarize => {
+                    // We don't care about tool use during summarization.
                 }
             }
 
@@ -280,13 +432,24 @@ impl Thread {
                     .push(MessageContent::Text(message.text.clone()));
             }
 
-            if let Some(tool_uses) = self.tool_uses_by_message.get(&message.id) {
-                for tool_use in tool_uses {
-                    request_message
-                        .content
-                        .push(MessageContent::ToolUse(tool_use.clone()));
+            match request_kind {
+                RequestKind::Chat => {
+                    self.tool_use
+                        .attach_tool_uses(message.id, &mut request_message);
+
+                    if matches!(message.role, Role::Assistant) {
+                        if let Some(script_id) = self.scripts_by_assistant_message.get(&message.id)
+                        {
+                            let script = self.script_session.read(cx).get(*script_id);
+
+                            request_message.content.push(script.source_tag().into());
+                        }
+                    }
                 }
-            }
+                RequestKind::Summarize => {
+                    // We don't care about tool use during summarization.
+                }
+            };
 
             request.messages.push(request_message);
         }
@@ -323,6 +486,8 @@ impl Thread {
             let stream_completion = async {
                 let mut events = stream.await?;
                 let mut stop_reason = StopReason::EndTurn;
+                let mut script_tag_parser = ScriptTagParser::new();
+                let mut script_id = None;
 
                 while let Some(event) = events.next().await {
                     let event = event?;
@@ -337,19 +502,43 @@ impl Thread {
                             }
                             LanguageModelCompletionEvent::Text(chunk) => {
                                 if let Some(last_message) = thread.messages.last_mut() {
-                                    if last_message.role == Role::Assistant {
-                                        last_message.text.push_str(&chunk);
+                                    let chunk = script_tag_parser.parse_chunk(&chunk);
+
+                                    let message_id = if last_message.role == Role::Assistant {
+                                        last_message.text.push_str(&chunk.content);
                                         cx.emit(ThreadEvent::StreamedAssistantText(
                                             last_message.id,
-                                            chunk,
+                                            chunk.content,
                                         ));
+                                        last_message.id
                                     } else {
                                         // If we won't have an Assistant message yet, assume this chunk marks the beginning
                                         // of a new Assistant response.
                                         //
                                         // Importantly: We do *not* want to emit a `StreamedAssistantText` event here, as it
                                         // will result in duplicating the text of the chunk in the rendered Markdown.
-                                        thread.insert_message(Role::Assistant, chunk, cx);
+                                        thread.insert_message(Role::Assistant, chunk.content, cx)
+                                    };
+
+                                    if script_id.is_none() && script_tag_parser.found_script() {
+                                        let id = thread
+                                            .script_session
+                                            .update(cx, |session, _cx| session.new_script());
+                                        thread.scripts_by_assistant_message.insert(message_id, id);
+
+                                        script_id = Some(id);
+                                    }
+
+                                    if let (Some(script_source), Some(script_id)) =
+                                        (chunk.script_source, script_id)
+                                    {
+                                        // TODO: move buffer to script and run as it streams
+                                        thread
+                                            .script_session
+                                            .update(cx, |this, cx| {
+                                                this.run_script(script_id, script_source, cx)
+                                            })
+                                            .detach_and_log_err(cx);
                                     }
                                 }
                             }
@@ -360,21 +549,8 @@ impl Thread {
                                     .rfind(|message| message.role == Role::Assistant)
                                 {
                                     thread
-                                        .tool_uses_by_message
-                                        .entry(last_assistant_message.id)
-                                        .or_default()
-                                        .push(tool_use.clone());
-
-                                    thread.pending_tool_uses_by_id.insert(
-                                        tool_use.id.clone(),
-                                        PendingToolUse {
-                                            assistant_message_id: last_assistant_message.id,
-                                            id: tool_use.id,
-                                            name: tool_use.name,
-                                            input: tool_use.input,
-                                            status: PendingToolUseStatus::Idle,
-                                        },
-                                    );
+                                        .tool_use
+                                        .request_tool_use(last_assistant_message.id, tool_use);
                                 }
                             }
                         }
@@ -451,7 +627,7 @@ impl Thread {
             return;
         }
 
-        let mut request = self.to_completion_request(RequestKind::Chat, cx);
+        let mut request = self.to_completion_request(RequestKind::Summarize, cx);
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
             content: vec![
@@ -492,9 +668,25 @@ impl Thread {
         });
     }
 
+    pub fn use_pending_tools(&mut self, cx: &mut Context<Self>) {
+        let pending_tool_uses = self
+            .pending_tool_uses()
+            .into_iter()
+            .filter(|tool_use| tool_use.status.is_idle())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for tool_use in pending_tool_uses {
+            if let Some(tool) = self.tools.tool(&tool_use.name, cx) {
+                let task = tool.run(tool_use.input, self.project.clone(), cx);
+
+                self.insert_tool_output(tool_use.id.clone(), task, cx);
+            }
+        }
+    }
+
     pub fn insert_tool_output(
         &mut self,
-        assistant_message_id: MessageId,
         tool_use_id: LanguageModelToolUseId,
         output: Task<Result<String>>,
         cx: &mut Context<Self>,
@@ -505,50 +697,35 @@ impl Thread {
                 let output = output.await;
                 thread
                     .update(&mut cx, |thread, cx| {
-                        // The tool use was requested by an Assistant message,
-                        // so we want to attach the tool results to the next
-                        // user message.
-                        let next_user_message = MessageId(assistant_message_id.0 + 1);
+                        thread
+                            .tool_use
+                            .insert_tool_output(tool_use_id.clone(), output);
 
-                        let tool_results = thread
-                            .tool_results_by_message
-                            .entry(next_user_message)
-                            .or_default();
-
-                        match output {
-                            Ok(output) => {
-                                tool_results.push(LanguageModelToolResult {
-                                    tool_use_id: tool_use_id.to_string(),
-                                    content: output,
-                                    is_error: false,
-                                });
-
-                                cx.emit(ThreadEvent::ToolFinished { tool_use_id });
-                            }
-                            Err(err) => {
-                                tool_results.push(LanguageModelToolResult {
-                                    tool_use_id: tool_use_id.to_string(),
-                                    content: err.to_string(),
-                                    is_error: true,
-                                });
-
-                                if let Some(tool_use) =
-                                    thread.pending_tool_uses_by_id.get_mut(&tool_use_id)
-                                {
-                                    tool_use.status = PendingToolUseStatus::Error(err.to_string());
-                                }
-                            }
-                        }
+                        cx.emit(ThreadEvent::ToolFinished { tool_use_id });
                     })
                     .ok();
             }
         });
 
-        if let Some(tool_use) = self.pending_tool_uses_by_id.get_mut(&tool_use_id) {
-            tool_use.status = PendingToolUseStatus::Running {
-                _task: insert_output_task.shared(),
-            };
-        }
+        self.tool_use
+            .run_pending_tool(tool_use_id, insert_output_task);
+    }
+
+    pub fn send_tool_results_to_model(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        cx: &mut Context<Self>,
+    ) {
+        // Insert a user message to contain the tool results.
+        self.insert_user_message(
+            // TODO: Sending up a user message without any content results in the model sending back
+            // responses that also don't have any content. We currently don't handle this case well,
+            // so for now we provide some text to keep the model on track.
+            "Here are the tool results.",
+            Vec::new(),
+            cx,
+        );
+        self.send_to_model(model, RequestKind::Chat, true, cx);
     }
 
     /// Cancels the last pending completion, if there are any pending.
@@ -576,12 +753,15 @@ pub enum ThreadEvent {
     StreamedCompletion,
     StreamedAssistantText(MessageId, String),
     MessageAdded(MessageId),
+    MessageEdited(MessageId),
+    MessageDeleted(MessageId),
     SummaryChanged,
     UsePendingTools,
     ToolFinished {
         #[allow(unused)]
         tool_use_id: LanguageModelToolUseId,
     },
+    ScriptFinished,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -589,27 +769,4 @@ impl EventEmitter<ThreadEvent> for Thread {}
 struct PendingCompletion {
     id: usize,
     _task: Task<()>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingToolUse {
-    pub id: LanguageModelToolUseId,
-    /// The ID of the Assistant message in which the tool use was requested.
-    pub assistant_message_id: MessageId,
-    pub name: String,
-    pub input: serde_json::Value,
-    pub status: PendingToolUseStatus,
-}
-
-#[derive(Debug, Clone)]
-pub enum PendingToolUseStatus {
-    Idle,
-    Running { _task: Shared<Task<()>> },
-    Error(#[allow(unused)] String),
-}
-
-impl PendingToolUseStatus {
-    pub fn is_idle(&self) -> bool {
-        matches!(self, PendingToolUseStatus::Idle)
-    }
 }
