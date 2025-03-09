@@ -1461,7 +1461,7 @@ impl SshRemoteConnection {
         // Create a TCP socket listener to handle requests from the askpass program on Windows
         // (since Windows doesn't support Unix domain sockets natively)
         let listener =
-            TcpListener::bind("127.0.0.1:0").context("failed to create askpass socket")?;
+            TcpListener::bind("127.0.0.1:0").await.context("failed to create askpass socket")?;
         let askpass_socket_addr = listener.local_addr()?;
 
         let (askpass_opened_tx, askpass_opened_rx) = oneshot::channel::<()>();
