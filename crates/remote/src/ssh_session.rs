@@ -1438,7 +1438,7 @@ impl RemoteConnection for SshRemoteConnection {
 }
 
 impl SshRemoteConnection {
-    #[cfg(unix)]
+    #[cfg(not(unix))]
     async fn new(
         _connection_options: SshConnectionOptions,
         _delegate: Arc<dyn SshClientDelegate>,
@@ -1448,6 +1448,7 @@ impl SshRemoteConnection {
         use futures::{io::BufReader, AsyncBufReadExt as _};
         use smol::net::TcpListener;
         use util::ResultExt as _;
+        use std::os::fd::FromRawFd;
 
         _delegate.set_status(Some("Connecting"), _cx);
 
@@ -1494,7 +1495,8 @@ impl SshRemoteConnection {
                         if let Some(kill_tx) = kill_tx.take() {
                             // Convert smol::TcpStream to std::TcpStream to tokio::TcpStream
                             // First get the underlying std::TcpStream 
-                            let std_stream = stream.into_std().unwrap();
+                            let raw_socket = stream.as_raw_socket();
+                            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_socket) };
                             // Then create a tokio::TcpStream from the std::TcpStream
                             let tokio_stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
                             kill_tx.send(tokio_stream).log_err();
