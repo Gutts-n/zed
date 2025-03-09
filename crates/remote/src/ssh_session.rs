@@ -1452,6 +1452,7 @@ impl SshRemoteConnection {
         use util::ResultExt as _;
         use std::os::fd::FromRawFd;
         use which::which;
+        use std::os::windows::io::AsRawSocket;
 
 
         _delegate.set_status(Some("Connecting"), _cx);
