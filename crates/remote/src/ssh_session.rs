@@ -1438,7 +1438,7 @@ impl RemoteConnection for SshRemoteConnection {
 }
 
 impl SshRemoteConnection {
-    #[cfg(not(unix))]
+    #[cfg(unix)]
     async fn new(
         _connection_options: SshConnectionOptions,
         _delegate: Arc<dyn SshClientDelegate>,
@@ -1504,25 +1504,25 @@ impl SshRemoteConnection {
 
         // Ensure OpenSSH is available on Windows
         anyhow::ensure!(
-            which::which("ssh").is_ok(),
-            "Cannot find `ssh` command, which is required to connect over SSH. Please install OpenSSH Client from Windows Features or use a third-party SSH client."
-        );
+        which::which("ssh").is_ok(),
+        "Cannot find `ssh` command, which is required to connect over SSH. Please install OpenSSH Client from Windows Features or use a third-party SSH client."
+    );
 
         // Create an askpass script that communicates back to this process using PowerShell
         let askpass_script = format!(
-            "@echo off\r\n\
-            powershell -Command \"$args = $args -join ' '; $client = New-Object System.Net.Sockets.TcpClient; \
-            $client.Connect('127.0.0.1', {}); \
-            $stream = $client.GetStream(); \
-            $writer = New-Object System.IO.StreamWriter($stream); \
-            $writer.Write($args + [char]0); \
-            $writer.Flush(); \
-            $reader = New-Object System.IO.StreamReader($stream); \
-            $response = $reader.ReadToEnd(); \
-            Write-Host $response; \
-            $client.Close()\"",
-            askpass_socket_addr.port()
-        );
+        "@echo off\r\n\
+        powershell -Command \"$args = $args -join ' '; $client = New-Object System.Net.Sockets.TcpClient; \
+        $client.Connect('127.0.0.1', {}); \
+        $stream = $client.GetStream(); \
+        $writer = New-Object System.IO.StreamWriter($stream); \
+        $writer.Write($args + [char]0); \
+        $writer.Flush(); \
+        $reader = New-Object System.IO.StreamReader($stream); \
+        $response = $reader.ReadToEnd(); \
+        Write-Host $response; \
+        $client.Close()\"",
+        askpass_socket_addr.port()
+    );
 
         let askpass_script_path = temp_dir.path().join("askpass.bat");
         fs::write(&askpass_script_path, askpass_script).await?;
@@ -1620,20 +1620,15 @@ impl SshRemoteConnection {
         };
 
         // Get the release channel, version, and commit using AsyncApp
-        // by properly converting to App when needed
-        let (release_channel, version, commit) = _cx.update(|cx_async| {
-            // Convert AsyncApp to App using the appropriate method
-            // The actual implementation depends on the internals of AsyncApp
-            // This solution assumes there's an `app()` method or similar
-            // that converts AsyncApp to App reference
-            let app = cx_async.with_app(|app| {
-                let release_channel = ReleaseChannel::global(app);
-                let version = AppVersion::global(app);
-                let commit = AppCommitSha::try_global(app);
-                (release_channel, version, commit)
-            })?;
+        // Since we don't have a `with_app` method, use update() directly for the needed values
+        let (release_channel, version, commit) = _cx.update(|cx_app| {
+            // Here, cx_app is the &mut App that the update method provides
+            // We need to directly call the functions on this
+            let release_channel = ReleaseChannel::global(cx_app);
+            let version = AppVersion::global(cx_app);
+            let commit = AppCommitSha::try_global(cx_app);
 
-            Ok(app)
+            Ok((release_channel, version, commit))
         })??;
 
         this.remote_binary_path = Some(

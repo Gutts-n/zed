@@ -10944,6 +10944,7 @@ dependencies = [
  "smol",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "util",
  "which 6.0.3",
 ]
