@@ -1448,12 +1448,11 @@ impl SshRemoteConnection {
         use futures::AsyncWriteExt as _;
         use futures::{io::BufReader, AsyncBufReadExt as _};
         use smol::net::TcpListener;
+        use std::os::fd::FromRawFd;
+        use std::os::windows::io::AsRawSocket;
         use std::os::windows::io::FromRawSocket;
         use util::ResultExt as _;
-        use std::os::fd::FromRawFd;
         use which::which;
-        use std::os::windows::io::AsRawSocket;
-
 
         _delegate.set_status(Some("Connecting"), _cx);
 
@@ -1462,8 +1461,9 @@ impl SshRemoteConnection {
             .prefix("zed-ssh-session")
             .tempdir()?;
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0").await.context("failed to create askpass socket")?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("failed to create askpass socket")?;
         let askpass_socket_addr = listener.local_addr()?;
 
         let (askpass_opened_tx, askpass_opened_rx) = oneshot::channel::<()>();
@@ -1485,20 +1485,24 @@ impl SshRemoteConnection {
                     if reader.read_until(b'\0', &mut buffer).await.is_err() {
                         buffer.clear();
                     }
+                    let askpass_delegate = askpass::AskPassDelegate::new(cx, {
+                        let delegate = delegate.clone();
+                        move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
+                    });
+
                     let password_prompt = String::from_utf8_lossy(&buffer);
-                    if let Some(password) = delegate
-                        .ask_password(password_prompt.to_string(), &mut cx)
-                        .context("failed to get ssh password")
-                        .and_then(|p| p)
-                        .log_err()
+                    if let Some(password) =
+                        askpass::AskPassSession::new(cx.background_executor(), askpass_delegate)
+                            .await?
                     {
                         stream.write_all(password.as_bytes()).await.log_err();
                     } else {
                         if let Some(kill_tx) = kill_tx.take() {
                             // Convert smol::TcpStream to std::TcpStream to tokio::TcpStream
-                            // First get the underlying std::TcpStream 
+                            // First get the underlying std::TcpStream
                             let raw_socket = stream.as_raw_socket();
-                            let std_stream = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
+                            let std_stream =
+                                unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
                             // Then create a tokio::TcpStream from the std::TcpStream
                             let tokio_stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
                             kill_tx.send(tokio_stream).log_err();
