@@ -1488,7 +1488,6 @@ impl SshRemoteConnection {
                     let password_prompt = String::from_utf8_lossy(&buffer);
                     if let Some(password) = delegate
                         .ask_password(password_prompt.to_string(), &mut cx)
-                        .await
                         .context("failed to get ssh password")
                         .and_then(|p| p)
                         .log_err()
