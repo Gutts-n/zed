@@ -1497,7 +1497,7 @@ impl SshRemoteConnection {
                             // Convert smol::TcpStream to std::TcpStream to tokio::TcpStream
                             // First get the underlying std::TcpStream 
                             let raw_socket = stream.as_raw_socket();
-                            let std_stream = unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
+                            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_socket) };
                             // Then create a tokio::TcpStream from the std::TcpStream
                             let tokio_stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
                             kill_tx.send(tokio_stream).log_err();
