@@ -1494,7 +1494,7 @@ impl SshRemoteConnection {
                         stream.write_all(password.as_bytes()).await.log_err();
                     } else {
                         if let Some(kill_tx) = kill_tx.take() {
-                            kill_tx.send(stream.into_std().unwrap().into()).log_err();
+                            kill_tx.send(stream.into().unwrap().into()).log_err();
                             break;
                         }
                     }
