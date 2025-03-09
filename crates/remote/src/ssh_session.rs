@@ -1438,7 +1438,7 @@ impl RemoteConnection for SshRemoteConnection {
 }
 
 impl SshRemoteConnection {
-    #[cfg(not(unix))]
+    #[cfg(unix)]
     async fn new(
         _connection_options: SshConnectionOptions,
         _delegate: Arc<dyn SshClientDelegate>,
@@ -1447,8 +1447,6 @@ impl SshRemoteConnection {
         use futures::AsyncWriteExt as _;
         use futures::{io::BufReader, AsyncBufReadExt as _};
         use smol::net::TcpListener;
-        use std::net::SocketAddr;
-        use tokio::io::AsyncReadExt;
         use util::ResultExt as _;
 
         _delegate.set_status(Some("Connecting"), _cx);
@@ -1494,7 +1492,12 @@ impl SshRemoteConnection {
                         stream.write_all(password.as_bytes()).await.log_err();
                     } else {
                         if let Some(kill_tx) = kill_tx.take() {
-                            kill_tx.send(<smol::async_net::TcpStream as Into<T>>::into(stream).into().unwrap().into()).log_err();
+                            // Convert smol::TcpStream to std::TcpStream to tokio::TcpStream
+                            // First get the underlying std::TcpStream 
+                            let std_stream = stream.into_std().unwrap();
+                            // Then create a tokio::TcpStream from the std::TcpStream
+                            let tokio_stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+                            kill_tx.send(tokio_stream).log_err();
                             break;
                         }
                     }
