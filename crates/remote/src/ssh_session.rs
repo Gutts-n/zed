@@ -1450,6 +1450,8 @@ impl SshRemoteConnection {
         use smol::net::TcpListener;
         use util::ResultExt as _;
         use std::os::fd::FromRawFd;
+        use which::which;
+
 
         _delegate.set_status(Some("Connecting"), _cx);
 
@@ -1458,8 +1460,6 @@ impl SshRemoteConnection {
             .prefix("zed-ssh-session")
             .tempdir()?;
 
-        // Create a TCP socket listener to handle requests from the askpass program on Windows
-        // (since Windows doesn't support Unix domain sockets natively)
         let listener =
             TcpListener::bind("127.0.0.1:0").await.context("failed to create askpass socket")?;
         let askpass_socket_addr = listener.local_addr()?;
@@ -1508,13 +1508,11 @@ impl SshRemoteConnection {
             }
         });
 
-        // Ensure OpenSSH is available on Windows
         anyhow::ensure!(
         which::which("ssh").is_ok(),
         "Cannot find `ssh` command, which is required to connect over SSH. Please install OpenSSH Client from Windows Features or use a third-party SSH client."
     );
 
-        // Create an askpass script that communicates back to this process using PowerShell
         let askpass_script = format!(
         "@echo off\r\n\
         powershell -Command \"$args = $args -join ' '; $client = New-Object System.Net.Sockets.TcpClient; \
@@ -1529,12 +1527,9 @@ impl SshRemoteConnection {
         $client.Close()\"",
         askpass_socket_addr.port()
     );
-
         let askpass_script_path = temp_dir.path().join("askpass.bat");
         fs::write(&askpass_script_path, askpass_script).await?;
 
-        // Windows uses a different approach for control sockets
-        // We'll use the ControlMaster equivalent for Windows: connection sharing
         let socket_path = temp_dir.path().join("ssh.sock");
 
         let mut master_process = process::Command::new("ssh")
@@ -1546,7 +1541,7 @@ impl SshRemoteConnection {
                 askpass_script_path.to_string_lossy().to_string(),
             )
             .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", "dummy:0.0") // Required for SSH_ASKPASS to work
+            .env("DISPLAY", "dummy:0.0")
             .args(_connection_options.additional_args())
             .args([
                 "-N",
@@ -1564,8 +1559,6 @@ impl SshRemoteConnection {
             .kill_on_drop(true)
             .spawn()?;
 
-        // Wait for this ssh process to close its stdout, indicating that authentication
-        // has completed.
         let mut stdout = master_process.stdout.take().unwrap();
         let mut output = Vec::new();
         let connection_timeout = Duration::from_secs(10);
@@ -1578,9 +1571,6 @@ impl SshRemoteConnection {
                         drop(stream);
                         Err(anyhow!("SSH connection canceled"))
                     }
-                    // If the askpass script has opened, that means the user is typing
-                    // their password, in which case we don't want to timeout anymore,
-                    // since we know a connection has been established.
                     result = stdout.read_to_end(&mut output).fuse() => {
                         result?;
                         Ok(())
@@ -1625,11 +1615,7 @@ impl SshRemoteConnection {
             remote_binary_path: None,
         };
 
-        // Get the release channel, version, and commit using AsyncApp
-        // Since we don't have a `with_app` method, use update() directly for the needed values
         let (release_channel, version, commit) = _cx.update(|cx_app| {
-            // Here, cx_app is the &mut App that the update method provides
-            // We need to directly call the functions on this
             let release_channel = ReleaseChannel::global(cx_app);
             let version = AppVersion::global(cx_app);
             let commit = AppCommitSha::try_global(cx_app);
