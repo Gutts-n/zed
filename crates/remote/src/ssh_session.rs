@@ -1447,109 +1447,39 @@ impl SshRemoteConnection {
         _delegate: Arc<dyn SshClientDelegate>,
         _cx: &mut AsyncApp,
     ) -> Result<Self> {
-        use futures::AsyncWriteExt as _;
-        use futures::{io::BufReader, AsyncBufReadExt as _};
-        use smol::net::TcpListener;
-        use std::os::fd::FromRawFd;
-        use std::os::windows::io::AsRawSocket;
-        use std::os::windows::io::FromRawSocket;
-        use util::ResultExt as _;
-        use which::which;
+        use askpass::AskPassResult;
 
-        _delegate.set_status(Some("Connecting"), _cx);
+        delegate.set_status(Some("Connecting"), cx);
 
-        let url = _connection_options.ssh_url();
+        let url = connection_options.ssh_url();
+
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
             .tempdir()?;
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .context("failed to create askpass socket")?;
-        let askpass_socket_addr = listener.local_addr()?;
-
-        let (askpass_opened_tx, askpass_opened_rx) = oneshot::channel::<()>();
-        let (askpass_kill_master_tx, askpass_kill_master_rx) =
-            oneshot::channel::<tokio::net::TcpStream>();
-        let mut kill_tx = Some(askpass_kill_master_tx);
-
-        let askpass_task = _cx.spawn({
-            let delegate = _delegate.clone();
-            |mut cx| async move {
-                let mut askpass_opened_tx = Some(askpass_opened_tx);
-
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    if let Some(askpass_opened_tx) = askpass_opened_tx.take() {
-                        askpass_opened_tx.send(()).ok();
-                    }
-                    let mut buffer = Vec::new();
-                    let mut reader = BufReader::new(&mut stream);
-                    if reader.read_until(b'\0', &mut buffer).await.is_err() {
-                        buffer.clear();
-                    }
-                    let askpass_delegate = askpass::AskPassDelegate::new(cx, {
-                        let delegate = delegate.clone();
-                        move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
-                    });
-
-                    let password_prompt = String::from_utf8_lossy(&buffer);
-                    if let Some(password) =
-                        askpass::AskPassSession::new(cx.background_executor(), askpass_delegate)
-                            .await?
-                    {
-                        stream.write_all(password.as_bytes()).await.log_err();
-                    } else {
-                        if let Some(kill_tx) = kill_tx.take() {
-                            // Convert smol::TcpStream to std::TcpStream to tokio::TcpStream
-                            // First get the underlying std::TcpStream
-                            let raw_socket = stream.as_raw_socket();
-                            let std_stream =
-                                unsafe { std::net::TcpStream::from_raw_socket(raw_socket) };
-                            // Then create a tokio::TcpStream from the std::TcpStream
-                            let tokio_stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
-                            kill_tx.send(tokio_stream).log_err();
-                            break;
-                        }
-                    }
-                }
-            }
+        let askpass_delegate = askpass::AskPassDelegate::new(cx, {
+            let delegate = delegate.clone();
+            move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
         });
 
-        anyhow::ensure!(
-        which::which("ssh").is_ok(),
-        "Cannot find `ssh` command, which is required to connect over SSH. Please install OpenSSH Client from Windows Features or use a third-party SSH client."
-    );
+        let mut askpass =
+            askpass::AskPassSession::new(cx.background_executor(), askpass_delegate).await?;
 
-        let askpass_script = format!(
-        "@echo off\r\n\
-        powershell -Command \"$args = $args -join ' '; $client = New-Object System.Net.Sockets.TcpClient; \
-        $client.Connect('127.0.0.1', {}); \
-        $stream = $client.GetStream(); \
-        $writer = New-Object System.IO.StreamWriter($stream); \
-        $writer.Write($args + [char]0); \
-        $writer.Flush(); \
-        $reader = New-Object System.IO.StreamReader($stream); \
-        $response = $reader.ReadToEnd(); \
-        Write-Host $response; \
-        $client.Close()\"",
-        askpass_socket_addr.port()
-    );
-        let askpass_script_path = temp_dir.path().join("askpass.bat");
-        fs::write(&askpass_script_path, askpass_script).await?;
-
-        let socket_path = temp_dir.path().join("ssh.sock");
+        // Start the master SSH process
+        let socket_path = {
+            {
+                use uuid::Uuid;
+                let pipe_name = Uuid::new_v4().to_simple().to_string();
+                PathBuf::from(format!("//./pipe/zed-ssh-{}", pipe_name))
+            }
+        };
 
         let mut master_process = process::Command::new("ssh")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(
-                "SSH_ASKPASS",
-                askpass_script_path.to_string_lossy().to_string(),
-            )
             .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", "dummy:0.0")
-            .args(_connection_options.additional_args())
+            .env("SSH_ASKPASS", &askpass.script_path())
+            .args(connection_options.additional_args())
             .args([
                 "-N",
                 "-o",
@@ -1557,11 +1487,8 @@ impl SshRemoteConnection {
                 "-o",
                 "ControlMaster=yes",
                 "-o",
+                &format!("ControlPath={}", socket_path.display()),
             ])
-            .arg(format!(
-                "ControlPath={}",
-                socket_path.to_string_lossy().to_string().replace("\\", "/")
-            ))
             .arg(&url)
             .kill_on_drop(true)
             .spawn()?;
