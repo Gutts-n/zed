@@ -1443,26 +1443,26 @@ impl RemoteConnection for SshRemoteConnection {
 impl SshRemoteConnection {
     #[cfg(windows)]
     async fn new(
-        _connection_options: SshConnectionOptions,
-        _delegate: Arc<dyn SshClientDelegate>,
-        _cx: &mut AsyncApp,
+        connection_options: SshConnectionOptions,
+        delegate: Arc<dyn SshClientDelegate>,
+        cx: &mut AsyncApp,
     ) -> Result<Self> {
         use askpass::AskPassResult;
 
-        _delegate.set_status(Some("Connecting"), _cx);
+        delegate.set_status(Some("Connecting"), cx);
 
-        let url = _connection_options.ssh_url();
+        let url = connection_options.ssh_url();
 
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
             .tempdir()?;
-        let askpass_delegate = askpass::AskPassDelegate::new(_cx, {
-            let delegate = _delegate.clone();
+        let askpass_delegate = askpass::AskPassDelegate::new(cx, {
+            let delegate = delegate.clone();
             move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
         });
 
         let mut askpass =
-            askpass::AskPassSession::new(_cx.background_executor(), askpass_delegate).await?;
+            askpass::AskPassSession::new(cx.background_executor(), askpass_delegate).await?;
 
         // Start the master SSH process
         let socket_path = {
@@ -1479,7 +1479,7 @@ impl SshRemoteConnection {
             .stderr(Stdio::piped())
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("SSH_ASKPASS", &askpass.script_path())
-            .args(_connection_options.additional_args())
+            .args(connection_options.additional_args())
             .args([
                 "-N",
                 "-o",
@@ -1495,7 +1495,6 @@ impl SshRemoteConnection {
 
         let mut stdout = master_process.stdout.take().unwrap();
         let mut output = Vec::new();
-        let connection_timeout = Duration::from_secs(10);
 
         let result = select_biased! {
             result = askpass.run().fuse() => {
@@ -1518,8 +1517,6 @@ impl SshRemoteConnection {
             return Err(e.context("Failed to connect to host"));
         }
 
-        drop(askpass);
-
         if master_process.try_status()?.is_some() {
             output.clear();
             let mut stderr = master_process.stderr.take().unwrap();
@@ -1532,8 +1529,10 @@ impl SshRemoteConnection {
             Err(anyhow!(error_message))?;
         }
 
+        drop(askpass);
+
         let socket = SshSocket {
-            connection_options: _connection_options,
+            connection_options,
             socket_path,
         };
 
@@ -1544,16 +1543,15 @@ impl SshRemoteConnection {
             remote_binary_path: None,
         };
 
-        let (release_channel, version, commit) = _cx.update(|cx_app| {
-            let release_channel = ReleaseChannel::global(cx_app);
-            let version = AppVersion::global(cx_app);
-            let commit = AppCommitSha::try_global(cx_app);
-
-            Ok((release_channel, version, commit))
-        })??;
-
+        let (release_channel, version, commit) = cx.update(|cx| {
+            (
+                ReleaseChannel::global(cx),
+                AppVersion::global(cx),
+                AppCommitSha::try_global(cx),
+            )
+        })?;
         this.remote_binary_path = Some(
-            this.ensure_server_binary(&_delegate, release_channel, version, commit, _cx)
+            this.ensure_server_binary(&delegate, release_channel, version, commit, cx)
                 .await?,
         );
 
