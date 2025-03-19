@@ -1449,26 +1449,26 @@ impl SshRemoteConnection {
     ) -> Result<Self> {
         use askpass::AskPassResult;
 
-        delegate.set_status(Some("Connecting"), cx);
+        _delegate.set_status(Some("Connecting"), _cx);
 
-        let url = connection_options.ssh_url();
+        let url = _connection_options.ssh_url();
 
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
             .tempdir()?;
-        let askpass_delegate = askpass::AskPassDelegate::new(cx, {
-            let delegate = delegate.clone();
+        let askpass_delegate = askpass::AskPassDelegate::new(_cx, {
+            let delegate = _delegate.clone();
             move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
         });
 
         let mut askpass =
-            askpass::AskPassSession::new(cx.background_executor(), askpass_delegate).await?;
+            askpass::AskPassSession::new(_cx.background_executor(), askpass_delegate).await?;
 
         // Start the master SSH process
         let socket_path = {
             {
                 use uuid::Uuid;
-                let pipe_name = Uuid::new_v4().to_simple().to_string();
+                let pipe_name = Uuid::new_v4().simple().to_string();
                 PathBuf::from(format!("//./pipe/zed-ssh-{}", pipe_name))
             }
         };
@@ -1479,7 +1479,7 @@ impl SshRemoteConnection {
             .stderr(Stdio::piped())
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("SSH_ASKPASS", &askpass.script_path())
-            .args(connection_options.additional_args())
+            .args(_connection_options.additional_args())
             .args([
                 "-N",
                 "-o",
@@ -1498,24 +1498,19 @@ impl SshRemoteConnection {
         let connection_timeout = Duration::from_secs(10);
 
         let result = select_biased! {
-            _ = askpass_opened_rx.fuse() => {
-                select_biased! {
-                    stream = askpass_kill_master_rx.fuse() => {
+            result = askpass.run().fuse() => {
+                match result {
+                    AskPassResult::CancelledByUser => {
                         master_process.kill().ok();
-                        drop(stream);
-                        Err(anyhow!("SSH connection canceled"))
+                        Err(anyhow!("SSH connection canceled"))?
                     }
-                    result = stdout.read_to_end(&mut output).fuse() => {
-                        result?;
-                        Ok(())
+                    AskPassResult::Timedout => {
+                        Err(anyhow!("connecting to host timed out"))?
                     }
                 }
             }
             _ = stdout.read_to_end(&mut output).fuse() => {
-                Ok(())
-            }
-            _ = futures::FutureExt::fuse(smol::Timer::after(connection_timeout)) => {
-                Err(anyhow!("Exceeded {:?} timeout trying to connect to host", connection_timeout))
+                anyhow::Ok(())
             }
         };
 
@@ -1523,7 +1518,7 @@ impl SshRemoteConnection {
             return Err(e.context("Failed to connect to host"));
         }
 
-        drop(askpass_task);
+        drop(askpass);
 
         if master_process.try_status()?.is_some() {
             output.clear();
