@@ -80,11 +80,6 @@ impl FeatureFlag for PredictEditsNonEagerModeFeatureFlag {
     }
 }
 
-pub struct GitUiFeatureFlag;
-impl FeatureFlag for GitUiFeatureFlag {
-    const NAME: &'static str = "git-ui";
-}
-
 pub struct Remoting {}
 impl FeatureFlag for Remoting {
     const NAME: &'static str = "remoting";
@@ -118,6 +113,11 @@ impl FeatureFlag for AutoCommand {
     fn enabled_for_staff() -> bool {
         false
     }
+}
+
+pub struct Debugger {}
+impl FeatureFlag for Debugger {
+    const NAME: &'static str = "debugger";
 }
 
 pub trait FeatureFlagViewExt<V: 'static> {
@@ -207,7 +207,7 @@ impl FeatureFlagAppExt for App {
     fn has_flag<T: FeatureFlag>(&self) -> bool {
         self.try_global::<FeatureFlags>()
             .map(|flags| flags.has_flag::<T>())
-            .unwrap_or(false)
+            .unwrap_or_else(|| T::enabled_in_development())
     }
 
     fn is_staff(&self) -> bool {

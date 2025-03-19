@@ -351,12 +351,13 @@ impl PickerDelegate for RecentProjectsDelegate {
 
     fn dismissed(&mut self, _window: &mut Window, _: &mut Context<Picker<Self>>) {}
 
-    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> SharedString {
-        if self.workspaces.is_empty() {
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        let text = if self.workspaces.is_empty() {
             "Recently opened projects will show up here".into()
         } else {
             "No matches".into()
-        }
+        };
+        Some(text)
     }
 
     fn render_match(
@@ -590,6 +591,7 @@ impl Render for MatchTooltip {
 mod tests {
     use std::path::PathBuf;
 
+    use dap::debugger_settings::DebuggerSettings;
     use editor::Editor;
     use gpui::{TestAppContext, UpdateGlobal, WindowHandle};
     use project::{project_settings::ProjectSettings, Project};
@@ -738,6 +740,7 @@ mod tests {
             crate::init(cx);
             editor::init(cx);
             workspace::init_settings(cx);
+            DebuggerSettings::register(cx);
             Project::init_settings(cx);
             state
         })

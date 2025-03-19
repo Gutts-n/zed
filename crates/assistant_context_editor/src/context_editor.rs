@@ -229,6 +229,7 @@ impl ContextEditor {
             editor.set_show_git_diff_gutter(false, cx);
             editor.set_show_code_actions(false, cx);
             editor.set_show_runnables(false, cx);
+            editor.set_show_breakpoints(false, cx);
             editor.set_show_wrap_guides(false, cx);
             editor.set_show_indent_guides(false, cx);
             editor.set_completion_provider(Some(Box::new(completion_provider)));
@@ -535,7 +536,6 @@ impl ContextEditor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn run_command(
         &mut self,
         command_range: Range<language::Anchor>,
@@ -2057,7 +2057,6 @@ impl ContextEditor {
             .unwrap_or_else(|| Cow::Borrowed(DEFAULT_TAB_TITLE))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_patch_block(
         &mut self,
         range: Range<text::Anchor>,
