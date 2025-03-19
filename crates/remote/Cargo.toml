@@ -20,6 +20,7 @@ test-support = ["fs/test-support"]
 [dependencies]
 anyhow.workspace = true
 askpass.workspace = true
+uuid = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["full"] }
 collections.workspace = true
